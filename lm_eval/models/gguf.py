@@ -189,6 +189,7 @@ class GGUFLM(LM):
         continuation=None,
         stop=None,
         max_tokens=None,
+        id_slot=None,
         retries=3,
         delay=5,
         **kwargs,
@@ -201,6 +202,10 @@ class GGUFLM(LM):
                 }
                 if self.model is not None:
                     request["model"] = self.model
+                if id_slot is not None:
+                    # pin the request to a specific server slot so that
+                    # prompts sharing a prefix hit the same per-slot KV cache
+                    request["id_slot"] = id_slot
                 if continuation is not None:
                     # llama.cpp ignores `echo` and never returns logprobs for
                     # prompt tokens, so the continuation cannot be scored by
@@ -231,11 +236,14 @@ class GGUFLM(LM):
                 time.sleep(delay)  # wait before retrying
         raise RuntimeError(f"Failed to get a valid response after {retries} retries.")
 
-    def _loglikelihood_one(self, args):
+    def _loglikelihood_one(self, item):
+        args, id_slot = item
         context, continuation = args
         if continuation == "":
             return (0.0, True)
-        response = self.gguf_completion(context=context, continuation=continuation)
+        response = self.gguf_completion(
+            context=context, continuation=continuation, id_slot=id_slot
+        )
         if response and "choices" in response and response["choices"]:
             choice = response["choices"][0]
             logprobs = choice.get("logprobs")
@@ -260,12 +268,34 @@ class GGUFLM(LM):
             logger.error(f"Invalid response for loglikelihood. Response: {response}")
             return (float("-inf"), False)
 
+    @staticmethod
+    def _assign_slots_by_context(args_list, parallel):
+        """Assign a server slot id to each (context, continuation) pair.
+
+        Consecutive requests sharing the same context (e.g. the candidate
+        continuations of one multiple-choice question) are pinned to the same
+        slot, so all but the first reuse the slot's cached prompt prefix.
+        Groups are round-robined across slots to keep them busy in parallel.
+        """
+        slots = []
+        group_idx = -1
+        prev_context = None
+        for context, _ in args_list:
+            if context != prev_context:
+                group_idx += 1
+                prev_context = context
+            slots.append(group_idx % parallel)
+        return slots
+
     def loglikelihood(self, requests, disable_tqdm: bool = False):
         if not requests:
             return []
+        parallel = self._resolve_parallel()
+        args_list = [req.args for req in requests]
+        slots = self._assign_slots_by_context(args_list, parallel)
         return self._map_requests(
             self._loglikelihood_one,
-            [req.args for req in requests],
+            list(zip(args_list, slots, strict=True)),
             disable_tqdm,
         )
 
@@ -273,6 +303,9 @@ class GGUFLM(LM):
         inp, request_args = args
         until = request_args.get("until", ["</s>"])
         max_gen_toks = request_args.get("max_gen_toks", None)
+        # no id_slot pinning here: generation lengths vary widely, so the
+        # server's dynamic idle-slot assignment load-balances better than a
+        # static assignment (measured ~30% slower with pinning on gsm8k)
         response = self.gguf_completion(
             context=inp, stop=until, max_tokens=max_gen_toks
         )

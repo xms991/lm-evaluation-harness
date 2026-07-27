@@ -235,6 +235,19 @@ class GGUFLMTest(unittest.TestCase):
         res = lm._map_requests(lambda x: x * 2, items, disable_tqdm=True)
         self.assertEqual(res, [x * 2 for x in items])
 
+    def test_assign_slots_by_context(self):
+        # consecutive same-context requests share a slot; groups round-robin
+        args = [
+            ("ctx1", "a"),
+            ("ctx1", "b"),
+            ("ctx2", "c"),
+            ("ctx3", "d"),
+            ("ctx2", "e"),
+        ]
+        self.assertEqual(GGUFLM._assign_slots_by_context(args, 2), [0, 0, 1, 0, 1])
+        # parallel=1 pins everything to slot 0
+        self.assertEqual(GGUFLM._assign_slots_by_context(args, 1), [0, 0, 0, 0, 0])
+
     def test_detect_total_slots(self):
         lm = GGUFLM(base_url)
         with patch("lm_eval.models.gguf.requests.get") as mock_get:
