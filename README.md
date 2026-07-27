@@ -188,6 +188,7 @@ lm_eval --model gguf \
 
 - Requires a llama.cpp release from December 2024 or newer, which returns logprobs in the modern OpenAI format (`logprobs.content`, see [llama.cpp#10783](https://github.com/ggml-org/llama.cpp/pull/10783)). The deprecated legacy format (`token_logprobs`) is not supported.
 - If the server runs in router mode (multiple models), pass the model name or alias: `--model_args base_url=http://127.0.0.1:8080,model=my-model-alias`.
+- Requests are issued concurrently. The default degree of parallelism is auto-detected from the server's slot count (`/props` → `total_slots`, i.e. llama-server's `--parallel` setting); override it with `parallel=<N>`. Note that llama.cpp's prompt caching makes requests sharing a prompt prefix (e.g. the continuations of one multiple-choice question) cheap when they reuse the same slot, so parallel speedups are largest for workloads with distinct prompts, and larger `--parallel` slot counts on the server help further.
 - `loglikelihood` is implemented via grammar-constrained generation: llama.cpp ignores `echo` and never returns prompt logprobs, so the continuation is forced with a GBNF grammar and scored from the pre-sampling logprobs llama.cpp reports for grammar-constrained tokens.
 - `loglikelihood_rolling` (perplexity tasks such as wikitext) is not implemented for this model type.
 

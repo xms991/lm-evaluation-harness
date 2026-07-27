@@ -1,5 +1,6 @@
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 from requests.exceptions import RequestException
@@ -95,6 +96,13 @@ class GGUFLM(LM):
     `--model gguf --model_args base_url=http://127.0.0.1:8080`.
     When the server runs in router mode (multiple models), also pass
     `model=<name-or-alias>` so requests are routed correctly.
+
+    Requests are issued concurrently with a thread pool. By default the
+    degree of parallelism is auto-detected from the server's `/props`
+    endpoint (`total_slots`, i.e. llama-server's `--parallel` setting);
+    override it with `parallel=<N>`. Note that llama-server only processes
+    as many requests simultaneously as it has slots, so values above the
+    server's slot count mostly add queueing on the server side.
     """
 
     def __init__(
@@ -105,22 +113,75 @@ class GGUFLM(LM):
         timeout=300,
         logprobs=10,
         temperature=0.0,
+        parallel=None,
         **kwargs,
     ):
         super().__init__()
         assert base_url, "must pass `base_url` to use GGUF LM!"
         base_url = base_url.rstrip("/")
-        if base_url.endswith("/completions"):
-            self.completions_url = base_url
-        elif base_url.endswith("/v1"):
-            self.completions_url = base_url + "/completions"
-        else:
-            self.completions_url = base_url + "/v1/completions"
+        # derive the server root so /props can be queried for auto-detection
+        server_url = base_url
+        for suffix in ("/v1/completions", "/completions", "/v1"):
+            if server_url.endswith(suffix):
+                server_url = server_url[: -len(suffix)]
+                break
+        self.server_url = server_url
+        self.completions_url = server_url + "/v1/completions"
         self.model = model
         self.logprobs = logprobs
         self.temperature = temperature
         self.max_length = max_length
         self.timeout = timeout
+        self.parallel = parallel
+        self._resolved_parallel = None
+
+    def _detect_total_slots(self):
+        """Query the server's /props endpoint for its slot count
+        (llama-server's `--parallel` setting). Returns None if unavailable.
+        """
+        try:
+            params = {"model": self.model} if self.model is not None else None
+            response = requests.get(
+                f"{self.server_url}/props", params=params, timeout=10
+            )
+            response.raise_for_status()
+            total_slots = response.json().get("total_slots")
+            if isinstance(total_slots, int) and total_slots > 0:
+                return total_slots
+        except (RequestException, ValueError) as e:
+            logger.debug(f"Could not query /props for slot count: {e}")
+        return None
+
+    def _resolve_parallel(self):
+        if self._resolved_parallel is None:
+            if self.parallel is not None:
+                self._resolved_parallel = max(1, int(self.parallel))
+            else:
+                total_slots = self._detect_total_slots()
+                self._resolved_parallel = total_slots or 1
+                if total_slots:
+                    logger.info(
+                        f"Auto-detected {total_slots} llama.cpp server slots; "
+                        f"issuing up to {total_slots} concurrent requests. "
+                        "Override with `parallel=<N>`."
+                    )
+        return self._resolved_parallel
+
+    def _map_requests(self, fn, items, disable_tqdm):
+        """Apply fn to each item, preserving order, using a thread pool when
+        parallelism is enabled.
+        """
+        parallel = self._resolve_parallel()
+        if parallel <= 1 or len(items) <= 1:
+            return [fn(item) for item in tqdm(items, disable=disable_tqdm)]
+        with ThreadPoolExecutor(max_workers=parallel) as executor:
+            return list(
+                tqdm(
+                    executor.map(fn, items),
+                    total=len(items),
+                    disable=disable_tqdm,
+                )
+            )
 
     def gguf_completion(
         self,
@@ -170,71 +231,71 @@ class GGUFLM(LM):
                 time.sleep(delay)  # wait before retrying
         raise RuntimeError(f"Failed to get a valid response after {retries} retries.")
 
+    def _loglikelihood_one(self, args):
+        context, continuation = args
+        if continuation == "":
+            return (0.0, True)
+        response = self.gguf_completion(context=context, continuation=continuation)
+        if response and "choices" in response and response["choices"]:
+            choice = response["choices"][0]
+            logprobs = choice.get("logprobs")
+            if logprobs and "content" in logprobs and logprobs["content"]:
+                try:
+                    return get_result(logprobs["content"], continuation)
+                except ValueError as e:
+                    logger.error(
+                        f"Could not parse logprobs for continuation "
+                        f"{continuation!r}: {e}"
+                    )
+                    return (float("-inf"), False)
+            else:
+                logger.error(
+                    "Invalid logprobs data. Expected 'logprobs' to contain a "
+                    "'content' list (the modern OpenAI logprobs format used by "
+                    "llama.cpp since PR #10783). Is the server a recent llama.cpp "
+                    f"llama-server? Response: {response}"
+                )
+                return (float("-inf"), False)
+        else:
+            logger.error(f"Invalid response for loglikelihood. Response: {response}")
+            return (float("-inf"), False)
+
     def loglikelihood(self, requests, disable_tqdm: bool = False):
         if not requests:
             return []
-        res = []
-        for context, continuation in tqdm(
-            [req.args for req in requests], disable=disable_tqdm
-        ):
-            if continuation == "":
-                res.append((0.0, True))
-                continue
-            response = self.gguf_completion(context=context, continuation=continuation)
-            if response and "choices" in response and response["choices"]:
-                choice = response["choices"][0]
-                logprobs = choice.get("logprobs")
-                if logprobs and "content" in logprobs and logprobs["content"]:
-                    try:
-                        res.append(get_result(logprobs["content"], continuation))
-                    except ValueError as e:
-                        logger.error(
-                            f"Could not parse logprobs for continuation "
-                            f"{continuation!r}: {e}"
-                        )
-                        res.append((float("-inf"), False))
-                else:
-                    logger.error(
-                        "Invalid logprobs data. Expected 'logprobs' to contain a "
-                        "'content' list (the modern OpenAI logprobs format used by "
-                        "llama.cpp since PR #10783). Is the server a recent llama.cpp "
-                        f"llama-server? Response: {response}"
-                    )
-                    res.append((float("-inf"), False))
+        return self._map_requests(
+            self._loglikelihood_one,
+            [req.args for req in requests],
+            disable_tqdm,
+        )
+
+    def _generate_one(self, args):
+        inp, request_args = args
+        until = request_args.get("until", ["</s>"])
+        max_gen_toks = request_args.get("max_gen_toks", None)
+        response = self.gguf_completion(
+            context=inp, stop=until, max_tokens=max_gen_toks
+        )
+        if response and "choices" in response and response["choices"]:
+            choice = response["choices"][0]
+            if "text" in choice:
+                return choice["text"].strip()
             else:
-                logger.error(
-                    f"Invalid response for loglikelihood. Response: {response}"
-                )
-                res.append((float("-inf"), False))
-        return res
+                logger.error(f"Invalid response for greedy_until. Response: {response}")
+                return None  # Add default value in case of error
+        else:
+            logger.error(f"Invalid response for greedy_until. Response: {response}")
+            return None  # Add default value in case of error
 
     def generate_until(self, requests, disable_tqdm: bool = False):
         if not requests:
             return []
 
-        res = []
-        for request in tqdm([req.args for req in requests], disable=disable_tqdm):
-            inp = request[0]
-            request_args = request[1]
-            until = request_args.get("until", ["</s>"])
-            max_gen_toks = request_args.get("max_gen_toks", None)
-            response = self.gguf_completion(
-                context=inp, stop=until, max_tokens=max_gen_toks
-            )
-            if response and "choices" in response and response["choices"]:
-                choice = response["choices"][0]
-                if "text" in choice:
-                    generated_text = choice["text"].strip()
-                    res.append(generated_text)
-                else:
-                    logger.error(
-                        f"Invalid response for greedy_until. Response: {response}"
-                    )
-                    res.append(None)  # Add default value in case of error
-            else:
-                logger.error(f"Invalid response for greedy_until. Response: {response}")
-                res.append(None)  # Add default value in case of error
-        return res
+        return self._map_requests(
+            self._generate_one,
+            [req.args for req in requests],
+            disable_tqdm,
+        )
 
     def loglikelihood_rolling(self, requests, disable_tqdm: bool = False):
         raise NotImplementedError(

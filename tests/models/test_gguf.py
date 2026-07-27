@@ -5,6 +5,8 @@ import pickle
 import unittest
 from unittest.mock import patch
 
+from requests.exceptions import RequestException
+
 from lm_eval.api.instance import Instance
 from lm_eval.models.gguf import GGUFLM, get_result
 
@@ -101,7 +103,7 @@ class GGUFLMTest(unittest.TestCase):
         "lm_eval.models.gguf.GGUFLM.gguf_completion", side_effect=gguf_completion_mock
     )
     def test_loglikelihood(self, gguf_completion_mock):
-        lm = GGUFLM(base_url)
+        lm = GGUFLM(base_url, parallel=1)
 
         # Test loglikelihood
         requests = [
@@ -123,7 +125,7 @@ class GGUFLMTest(unittest.TestCase):
         "lm_eval.models.gguf.GGUFLM.gguf_completion", side_effect=gguf_completion_mock
     )
     def test_loglikelihood_empty_continuation(self, gguf_completion_mock):
-        lm = GGUFLM(base_url)
+        lm = GGUFLM(base_url, parallel=1)
 
         requests = [
             Instance(
@@ -144,7 +146,7 @@ class GGUFLMTest(unittest.TestCase):
         "lm_eval.models.gguf.GGUFLM.gguf_completion", side_effect=gguf_completion_mock
     )
     def test_generate_until(self, gguf_completion_mock):
-        lm = GGUFLM(base_url)
+        lm = GGUFLM(base_url, parallel=1)
 
         # Test generate_until
         requests = [
@@ -226,6 +228,42 @@ class GGUFLMTest(unittest.TestCase):
         # running out of tokens before matching the continuation raises
         with self.assertRaises(ValueError):
             get_result(make_content([("in", -1.0, {"in": -1.0})]), "ing")
+
+    def test_parallel_mapping_preserves_order(self):
+        lm = GGUFLM(base_url, parallel=3)
+        items = list(range(20))
+        res = lm._map_requests(lambda x: x * 2, items, disable_tqdm=True)
+        self.assertEqual(res, [x * 2 for x in items])
+
+    def test_detect_total_slots(self):
+        lm = GGUFLM(base_url)
+        with patch("lm_eval.models.gguf.requests.get") as mock_get:
+            mock_get.return_value.json.return_value = {"total_slots": 4}
+            self.assertEqual(lm._detect_total_slots(), 4)
+            self.assertEqual(lm._resolve_parallel(), 4)
+
+        lm = GGUFLM(base_url)
+        with patch(
+            "lm_eval.models.gguf.requests.get",
+            side_effect=RequestException("no server"),
+        ):
+            self.assertIsNone(lm._detect_total_slots())
+            # falls back to serial requests
+            self.assertEqual(lm._resolve_parallel(), 1)
+
+    def test_completions_url_derivation(self):
+        for base, expected in [
+            ("http://localhost:8080", "http://localhost:8080/v1/completions"),
+            ("http://localhost:8080/", "http://localhost:8080/v1/completions"),
+            ("http://localhost:8080/v1", "http://localhost:8080/v1/completions"),
+            (
+                "http://localhost:8080/v1/completions",
+                "http://localhost:8080/v1/completions",
+            ),
+        ]:
+            lm = GGUFLM(base, parallel=1)
+            self.assertEqual(lm.completions_url, expected)
+            self.assertEqual(lm.server_url, "http://localhost:8080")
 
 
 if __name__ == "__main__":
