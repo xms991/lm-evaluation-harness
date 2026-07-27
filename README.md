@@ -176,6 +176,21 @@ lm_eval --model hf \
 > [!Tip]
 > Ensure the tokenizer path points to a valid Hugging Face tokenizer directory (e.g., containing tokenizer_config.json, vocab.json, etc.).
 
+#### Evaluating GGUF Models Served by llama.cpp
+
+The `gguf` model type evaluates models hosted by a [llama.cpp](https://github.com/ggml-org/llama.cpp) server (`llama-server`) through its OpenAI-compatible `/v1/completions` endpoint:
+
+```bash
+lm_eval --model gguf \
+    --model_args base_url=http://127.0.0.1:8080 \
+    --tasks hellaswag
+```
+
+- Requires a llama.cpp release from December 2024 or newer, which returns logprobs in the modern OpenAI format (`logprobs.content`, see [llama.cpp#10783](https://github.com/ggml-org/llama.cpp/pull/10783)). The deprecated legacy format (`token_logprobs`) is not supported.
+- If the server runs in router mode (multiple models), pass the model name or alias: `--model_args base_url=http://127.0.0.1:8080,model=my-model-alias`.
+- `loglikelihood` is implemented via grammar-constrained generation: llama.cpp ignores `echo` and never returns prompt logprobs, so the continuation is forced with a GBNF grammar and scored from the pre-sampling logprobs llama.cpp reports for grammar-constrained tokens.
+- `loglikelihood_rolling` (perplexity tasks such as wikitext) is not implemented for this model type.
+
 #### Multi-GPU Evaluation with Hugging Face `accelerate`
 
 We support three main ways of using Hugging Face's [accelerate 🚀](https://github.com/huggingface/accelerate) library for multi-GPU evaluation.
