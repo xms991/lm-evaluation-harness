@@ -1,5 +1,11 @@
 # Language Model Evaluation Harness
 
+# DO NOT USE THIS, GO USE THE MAIN REPO, IT'S FIXED NOW :) 
+## This is a vibe-coded fork of Eleuther AI's lm-evaluation-harnesss repo
+I used Kimi code to make some updates to fix llama.cpp support for my own testing. Other hardworking and lovely people later made PRs and did all the work to incorporate this into the main repo. llama.cpp support in the main repo should work now, so go use that instead. 
+
+
+---
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.10256836.svg)](https://doi.org/10.5281/zenodo.10256836)
 
 ---
